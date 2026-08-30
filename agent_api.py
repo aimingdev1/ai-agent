@@ -3,6 +3,8 @@ from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from ddgs import DDGS
 import os
+import re
+import math
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime
@@ -40,12 +42,99 @@ def search_tool(query):
         return "搜索失败,请稍后再试"
 
 
+# ===== RAG 知识库检索工具 =====
+RAG_DOCS = [
+    "RAG全称是检索增强生成，核心是先检索再生成，用来解决大模型知识有截止日期、答不了私有文档的问题。",
+    "ReAct是一种智能体推理框架，让模型交替进行思考和行动，可以调用外部工具，并支持多步推理。",
+    "向量数据库用来存储文本的向量表示，支持按相似度快速找出最相关的片段。",
+    "Embedding是把文字变成一串数字，语义相近的文字对应的向量也相近，是检索的基础。",
+]
+
+# 1) 分块
+def _rag_split(text, max_len=100):
+    if len(text) <= max_len:
+        return [text]
+    return [text[i:i + max_len] for i in range(0, len(text), max_len)]
+
+_RAG_CHUNKS = []
+for _d in RAG_DOCS:
+    _RAG_CHUNKS.extend(_rag_split(_d))
+
+# 2) 向量化（TF-IDF，替代真实 Embedding，原理等价：文字→数字向量→算相似度）
+def _rag_tokenize(text):
+    return re.findall(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+", text.lower())
+
+_RAG_VOCAB = {}
+for _c in _RAG_CHUNKS:
+    for _w in set(_rag_tokenize(_c)):
+        if _w not in _RAG_VOCAB:
+            _RAG_VOCAB[_w] = len(_RAG_VOCAB)
+_RAG_VOCAB_SIZE = len(_RAG_VOCAB)
+
+_RAG_N = len(_RAG_CHUNKS)
+_rag_df = {}
+for _c in _RAG_CHUNKS:
+    for _w in set(_rag_tokenize(_c)):
+        _rag_df[_w] = _rag_df.get(_w, 0) + 1
+_RAG_IDF = {_w: math.log((_RAG_N + 1) / (_rag_df[_w] + 1)) + 1 for _w in _rag_df}
+
+def _rag_vector(text):
+    vec = [0.0] * _RAG_VOCAB_SIZE
+    words = _rag_tokenize(text)
+    if not words:
+        return vec
+    tf = {}
+    for w in words:
+        tf[w] = tf.get(w, 0) + 1
+    for w, c in tf.items():
+        if w in _RAG_VOCAB:
+            vec[_RAG_VOCAB[w]] = (c / len(words)) * _RAG_IDF.get(w, 1.0)
+    return vec
+
+_RAG_CHUNK_VECTORS = [_rag_vector(c) for c in _RAG_CHUNKS]
+
+def _rag_cos(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+# 3) RAG 检索工具
+def rag_tool(query):
+    """知识库检索工具：智能体用它查私有知识库"""
+    q_vec = _rag_vector(query)
+    scored = [(_rag_cos(q_vec, cv), i) for i, cv in enumerate(_RAG_CHUNK_VECTORS)]
+    scored.sort(reverse=True)
+    top = scored[:3]
+    result = "\n".join(f"[{j+1}] {_RAG_CHUNKS[i]}" for j, (_, i) in enumerate(top))
+    return f"检索到的相关资料:\n{result}"
+
+# 4) RAG 作答
+def rag_answer(question, knowledge):
+    prompt = f"""你是问答助手。请只根据下面【资料】回答问题，如果资料里没有答案，就如实回答"资料中没有相关信息"，不要编造。
+
+【资料】
+{knowledge}
+
+【问题】{question}
+"""
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        stream=False,
+    )
+    return response.choices[0].message.content
+
+
 # 4. Agent核心大脑
 def agent_think(user_input):
     messages = [
-        {"role": "system", "content": """你是一个智能助手，可以调用两个工具：
+        {"role": "system", "content": """你是一个智能助手，可以调用三个工具：
 1. 计算器：需要计算时，回复必须以 CALCULATE: 开头
-2. 搜索：需要查信息时，回复必须以 SEARCH: 开头
+2. 搜索：需要查网络信息时，回复必须以 SEARCH: 开头
+3. 知识库检索：需要查询关于智能体、RAG、Embedding、向量数据库等私有知识库内容时，回复必须以 RAG: 开头
 其他情况直接回复。"""},
         {"role": "user", "content": user_input}
     ]
@@ -67,7 +156,7 @@ def health_check():
 @app.get("/chat")
 def chat_endpoint(msg: str = ""):
     if not msg:
-        return {"reply": "你好！我是你的AI助手，可以帮你计算、搜索，请随便问我吧！"}
+        return {"reply": "你好！我是你的AI助手，可以帮你计算、搜索、查知识库，请随便问我吧！"}
 
     # 调用Agent大脑
     ai_response = agent_think(msg)
@@ -79,6 +168,10 @@ def chat_endpoint(msg: str = ""):
     elif ai_response.startswith("SEARCH:"):
         query = ai_response.replace("SEARCH:", "").strip()
         final = search_tool(query)
+    elif ai_response.startswith("RAG:"):
+        query = ai_response.replace("RAG:", "").strip()
+        knowledge = rag_tool(query)       # ① 检索私有知识库拿资料
+        final = rag_answer(msg, knowledge)  # ② 把资料回灌给 LLM 生成答案
     else:
         final = ai_response
 
