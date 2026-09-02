@@ -155,11 +155,18 @@ def rag_answer(question, knowledge):
 # 4. Agent核心大脑
 def agent_think(user_input):
     messages = [
-        {"role": "system", "content": """你是一个智能助手，可以调用三个工具：
-1. 计算器：需要计算时，回复必须以 CALCULATE: 开头
-2. 搜索：需要查网络信息时，回复必须以 SEARCH: 开头
-3. 知识库检索：需要查询关于智能体、RAG、Embedding、向量数据库等私有知识库内容时，回复必须以 RAG: 开头
-其他情况直接回复。"""},
+        {"role": "system", "content": """你是智能助手的路由模块，必须判断用户的问题该用哪个工具处理。严格按规则选择：
+
+1. 涉及数字计算、算式求解 → 必须回复 CALCULATE: 算式（例如 CALCULATE: 12*34）
+2. 涉及实时/最新信息：新闻、天气、行情、最新型号、近期动态 → 必须回复 SEARCH: 检索词
+3. 涉及知识库主题：RAG、检索增强生成、ReAct、智能体、向量数据库、Embedding → 必须回复 RAG: 检索词
+4. 仅当问题是打招呼、闲聊、创作类等与以上工具都无关时，才直接回答
+
+示例：
+用户：帮我算 3乘以8 → CALCULATE: 3*8
+用户：今天有什么AI新闻 → SEARCH: 今日AI新闻
+用户：什么是Embedding → RAG: Embedding
+用户：写一句鼓励我的话 → （直接回答，不加前缀）"""},
         {"role": "user", "content": user_input}
     ]
 
@@ -208,7 +215,8 @@ def chat_endpoint(msg: str = ""):
     if key in _CACHE:
         _stats["cache_hit"] += 1
         logger.info("缓存命中 | 问题=%s...", key[:30])
-        return {"reply": _CACHE[key], "cached": True}
+        reply, route = _CACHE[key]
+        return {"reply": reply, "cached": True, "route": route}
 
     # ② 缓存未命中，走正常流程
     t0 = time.time()
@@ -236,12 +244,12 @@ def chat_endpoint(msg: str = ""):
     _stats["tool"][route] += 1
     logger.info("请求完成 | 路由=%s | 总耗时%.2fs | 问题=%s...", route, time.time() - t0, key[:30])
 
-    # ④ 存入缓存（满了就挤掉最早的一条，简单FIFO）
+    # ④ 存入缓存（满了就挤掉最早的一条，简单FIFO；连同路由一起存，命中时也能返回route）
     if len(_CACHE) >= _CACHE_MAX:
         _CACHE.pop(next(iter(_CACHE)))
-    _CACHE[key] = final
+    _CACHE[key] = (final, route)
 
-    return {"reply": final, "cached": False}
+    return {"reply": final, "cached": False, "route": route}
 
 
 # 6. 一个简单的网页首页
