@@ -5,6 +5,8 @@ from ddgs import DDGS
 import os
 import re
 import math
+import time          # ⏱ 计算每次请求耗时（工程化：可观测）
+import logging        # 📝 记录日志（工程化：可观测）
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime
@@ -17,6 +19,28 @@ client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com"
 )
+
+# ===== 工程化模块一：日志（每次调用留痕，出问题能回查"哪一步慢、哪一步错"） =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),                              # 同步打到控制台
+        logging.FileHandler("agent.log", encoding="utf-8"),    # 同时存到文件
+    ],
+)
+logger = logging.getLogger("agent")
+
+# ===== 工程化模块二：结果缓存（同一个问题再问，直接返回上次答案，0成本0延迟） =====
+_CACHE = {}          # {问题: 上次的回答}
+_CACHE_MAX = 100     # 最多缓存100条，防止内存无限膨胀
+
+# ===== 工程化模块三：简易统计（用来算缓存命中率、看工具被调多少次） =====
+_stats = {
+    "total": 0,
+    "cache_hit": 0,
+    "tool": {"CALCULATE": 0, "SEARCH": 0, "RAG": 0, "DIRECT": 0},
+}
 
 
 
@@ -139,11 +163,15 @@ def agent_think(user_input):
         {"role": "user", "content": user_input}
     ]
 
+    t0 = time.time()
     response = client.chat.completions.create(
         model="deepseek-chat",
         messages=messages,
         stream=False,
     )
+    # 记录这一步的耗时和token消耗（定位问题时能分清是"决策慢"还是"工具慢"）
+    tokens = getattr(response.usage, "total_tokens", 0)
+    logger.info("LLM决策 | 耗时%.2fs | tokens=%s", time.time() - t0, tokens)
 
     ai_text = response.choices[0].message.content
     return ai_text if ai_text else ""
@@ -153,29 +181,67 @@ def agent_think(user_input):
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "Agent is running"}
+
+@app.get("/stats")
+def stats_endpoint():
+    """可观测性：缓存命中率 + 各工具调用次数，验证缓存真的在工作"""
+    total = _stats["total"]
+    hits = _stats["cache_hit"]
+    return {
+        "total": total,
+        "cache_hit": hits,
+        "cache_miss": total - hits,
+        "hit_rate": f"{hits / total * 100:.1f}%" if total else "N/A",
+        "cache_size": len(_CACHE),
+        "tool_usage": _stats["tool"],
+    }
+
 @app.get("/chat")
 def chat_endpoint(msg: str = ""):
     if not msg:
         return {"reply": "你好！我是你的AI助手，可以帮你计算、搜索、查知识库，请随便问我吧！"}
 
-    # 调用Agent大脑
+    _stats["total"] += 1
+    key = msg.strip()
+
+    # ① 先查缓存：命中直接返回上次答案（不调LLM、不花钱、毫秒级）
+    if key in _CACHE:
+        _stats["cache_hit"] += 1
+        logger.info("缓存命中 | 问题=%s...", key[:30])
+        return {"reply": _CACHE[key], "cached": True}
+
+    # ② 缓存未命中，走正常流程
+    t0 = time.time()
     ai_response = agent_think(msg)
 
     # 判断调用哪个工具
     if ai_response.startswith("CALCULATE:"):
+        route = "CALCULATE"
         expression = ai_response.replace("CALCULATE:", "").strip()
         final = calculator_tool(expression)
     elif ai_response.startswith("SEARCH:"):
+        route = "SEARCH"
         query = ai_response.replace("SEARCH:", "").strip()
         final = search_tool(query)
     elif ai_response.startswith("RAG:"):
+        route = "RAG"
         query = ai_response.replace("RAG:", "").strip()
         knowledge = rag_tool(query)       # ① 检索私有知识库拿资料
         final = rag_answer(msg, knowledge)  # ② 把资料回灌给 LLM 生成答案
     else:
+        route = "DIRECT"
         final = ai_response
 
-    return {"reply": final}
+    # ③ 记录这一单：走了哪条路、总共花多久
+    _stats["tool"][route] += 1
+    logger.info("请求完成 | 路由=%s | 总耗时%.2fs | 问题=%s...", route, time.time() - t0, key[:30])
+
+    # ④ 存入缓存（满了就挤掉最早的一条，简单FIFO）
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
+    _CACHE[key] = final
+
+    return {"reply": final, "cached": False}
 
 
 # 6. 一个简单的网页首页
